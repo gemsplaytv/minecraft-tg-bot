@@ -14,6 +14,9 @@ from aiogram.fsm.state import State, StatesGroup
 # --- НАСТРОЙКИ ---
 API_TOKEN = '8466170276:AAFlob5hAA1oTFS5rtDpiDpvco-tKW0zPG8'
 CF_API_KEY = '$2a$10$.GHpJbr3exg35LxCoFgokeVU.uCzpPex5nQa4YyT7rsvWzO4MS1Aa'
+# ДОБАВЛЕНО: Данные твоего канала
+CHANNEL_ID = -1003801721298
+CHANNEL_URL = "https://t.me/gemsplaytv"
 
 CF_BASE = "https://api.curseforge.com/v1"
 MR_BASE = "https://api.modrinth.com/v2"
@@ -21,14 +24,12 @@ HEADERS_CF = {"x-api-key": CF_API_KEY}
 HEADERS_MR = {"User-Agent": "MinecraftBot/1.0 (contact@example.com)"}
 ITEMS_PER_PAGE = 12
 
-# ИЗМЕНЕНО: WARNING вместо INFO, чтобы бот не тратил память на запись каждого шага
 logging.basicConfig(level=logging.WARNING, filename="errors.log", 
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# ДОБАВЛЕНО: Лимиты на соединения, чтобы httpx не «раздувался» в памяти
 limits = httpx.Limits(max_connections=5, max_keepalive_connections=2)
 client = httpx.AsyncClient(timeout=20.0, limits=limits)
 
@@ -45,7 +46,16 @@ CATEGORIES = {
     "plugin": "Плагины"
 }
 
-# ДОБАВЛЕНО: Фоновая задача, которая вычищает мусор из ОЗУ каждые 2 минуты
+# --- ФУНКЦИЯ ПРОВЕРКИ ПОДПИСКИ ---
+async def is_subscribed(user_id: int):
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except Exception:
+        return False
+
 async def memory_cleaner():
     while True:
         await asyncio.sleep(120)
@@ -55,6 +65,10 @@ async def memory_cleaner():
 
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
+    # ПРОВЕРКА ПОДПИСКИ
+    if not await is_subscribed(msg.from_user.id):
+        return await msg.answer(f"❌ **Доступ ограничен!**\n\nЧтобы пользоваться ботом, подпишись на наш канал:\n👉 {CHANNEL_URL}")
+
     await state.clear()
     builder = InlineKeyboardBuilder()
     for code, name in CATEGORIES.items():
@@ -64,6 +78,10 @@ async def cmd_start(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("cat_"))
 async def set_category(call: types.CallbackQuery, state: FSMContext):
+    # ПРОВЕРКА ПОДПИСКИ
+    if not await is_subscribed(call.from_user.id):
+        return await call.answer("Нужна подписка на канал!", show_alert=True)
+
     category = call.data.split("_")[1]
     await state.update_data(category=category)
     await call.message.edit_text(f"Выбрано: {CATEGORIES[category]}.\nНапиши название для поиска:")
@@ -71,19 +89,21 @@ async def set_category(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(SearchState.query)
 async def process_search(msg: types.Message, state: FSMContext):
+    # ПРОВЕРКА ПОДПИСКИ
+    if not await is_subscribed(msg.from_user.id):
+        return await msg.answer(f"❌ Подпишись на канал, чтобы продолжить поиск:\n{CHANNEL_URL}")
+
     data = await state.get_data()
     cat = data['category']
     query = msg.text
     
     found_mr, found_cf = [], []
 
-    # 1. Поиск Modrinth
     try:
         r_mr = await client.get(f"{MR_BASE}/search", params={"query": query, "facets": f'[["project_type:{cat.replace("mc-mod", "mod")}"]]'}, headers=HEADERS_MR)
         if r_mr.status_code == 200: found_mr = r_mr.json()['hits']
     except Exception as e: logging.error(f"MR Search Error: {e}")
 
-    # 2. Поиск CurseForge
     try:
         class_id = {"mc-mod": 6, "resourcepack": 12, "shader": 6552, "modpack": 4471, "plugin": 5, "datapack": 6945}.get(cat, 6)
         r_cf = await client.get(f"{CF_BASE}/mods/search", params={"gameId": 432, "classId": class_id, "searchFilter": query, "pageSize": 5}, headers=HEADERS_CF)
@@ -108,10 +128,14 @@ async def process_search(msg: types.Message, state: FSMContext):
 
     builder.adjust(1)
     await msg.answer("Найденные результаты:", reply_markup=builder.as_markup())
-    gc.collect() # ДОБАВЛЕНО: Чистка после тяжелого поиска
+    gc.collect()
 
 @dp.callback_query(F.data.startswith("proj_"))
 async def select_loader(call: types.CallbackQuery):
+    # ПРОВЕРКА ПОДПИСКИ
+    if not await is_subscribed(call.from_user.id):
+        return await call.answer("Нужна подписка на канал!", show_alert=True)
+
     _, src, p_id, cat = call.data.split("_")
     
     if cat not in ["mc-mod", "mod"]:
@@ -183,7 +207,6 @@ async def render_versions(call, src, p_id, loader, page):
 
     await call.message.edit_text(f"Версии для {loader.upper()} (Стр. {page+1}/{max(1, total_pages)}):", 
                                 reply_markup=builder.as_markup())
-    # ДОБАВЛЕНО: Сразу очищаем временные данные
     all_versions_map.clear()
     gc.collect()
 
@@ -211,20 +234,13 @@ async def download_file(call: types.CallbackQuery):
         except Exception as e:
             await call.message.answer(f"Ошибка при скачивании: {e}")
     else:
-        # ИСПРАВЛЕННАЯ ЛОГИКА ДЛЯ CURSEFORGE
         try:
-            # Сначала получаем информацию о проекте, чтобы достать его slug и тип контента
             r_project = await client.get(f"{CF_BASE}/mods/{p_id}", headers=HEADERS_CF)
             if r_project.status_code == 200:
                 proj_data = r_project.json()['data']
                 slug = proj_data['slug']
-                
-                # Определяем правильный раздел в URL на основе classId
-                # 6 - mods, 12 - resource-packs, 6552 - shaders и т.д.
                 cid = proj_data['classId']
                 section = {6: "mc-mods", 12: "texture-packs", 6552: "customization", 4471: "modpacks", 5: "bukkit-plugins", 6945: "data-packs"}.get(cid, "mc-mods")
-                
-                # Формируем рабочую ссылку на страницу загрузки
                 download_url = f"https://www.curseforge.com/minecraft/{section}/{slug}/download/{f_id}"
                 await call.message.answer(f"✅ Ссылка на скачивание:\n{download_url}")
             else:
@@ -233,10 +249,9 @@ async def download_file(call: types.CallbackQuery):
             logging.error(f"CF Link Error: {e}")
             await call.message.answer("❌ Ошибка при формировании ссылки.")
 
-    gc.collect() # ДОБАВЛЕНО: Чистка после скачивания
+    gc.collect()
 
 async def main():
-    # ДОБАВЛЕНО: Запуск «уборщика» памяти в фоне
     asyncio.create_task(memory_cleaner())
     await dp.start_polling(bot)
 
